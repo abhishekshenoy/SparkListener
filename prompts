@@ -1,20 +1,19 @@
-This is great , now I want to achieve one more thing. 
+Hi Claude , I have a use case to solve for that I have depicted below wherein I am using Apache Spark 3.3.2 , Java 8 and Scala 2.12.4
 
-I have a use case wherein I am trying to capture metadata around all the workflows in my ETL workflows and I want to write a pluggable listener to my Apache Spark ETL jobs. 
+In my use case I am trying to capture metadata around all the  ETL workflows written in spark Scala by writing a pluggable listener to my Apache Spark ETL jobs. 
 
 My goal that I want to achieve with this listener is as below .
 
 Whenever there is an Action in called in Spark , I want my listener to capture the below details. 
 
-1) I want to capture the different data sources that are read and currently want to focus only on the below sources. 
-* It can be a file source on local filesystem , cloud storage or Hadoop file system 
-* It can be a table in hive which is again data in any of the file systems. 
+1) I want to capture specifically for FileSources that are read and currently want to focus only on the below sources. 
+* It can be a file source on local filesystem , cloud storage or Hadoop file system  and focus on file format being Parquet or ORC.
 
 2) Metrics around Files Read , Records Read , Data Size Scanned from the source. 
 
 3) The filter operations that are applied on the above sources.
 
-4) Metrics post the filter operations are applied. 
+4) Metrics around Files Read , Records Read , Data Size Scanned post the filter operations are applied on the datasource.As per my knowledge , this logic should be same and deducible irrespective of type of FileSource (LocalFs , HDFS , Cloud Storage).
 
 Once you are able to capture the metrics what I want to represent is below. 
 
@@ -26,8 +25,7 @@ In Source Node Detail I want to capture Table/Folder Name , columns projected , 
 
 In Target Node Detail I want to capture Table/Folder Name and Metrics.
 
-I want to have the Listner written in Scala . Also to give a hint , I have tried this multiple times using other AI but all are able to capture the Metadata around tables and filters but none were able to give the correct code to accurate capture the metrics and represent it as I have mentioned. Hope you do a deep analysis of the Spark Source Code and help me figure this out correctly.
-
+I want to have the Listener written in Scala .Also to give a hint , I have tried this multiple times using other AI but all are able to capture the Metadata around tables and filters but none were able to give the correct code to accurate capture the metrics and represent it as I have mentioned. Hope you do a deep analysis of the Spark Source Code and help me figure this out correctly.
 
 ——————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -80,4 +78,3 @@ metadataListener.captureQueryExecution(spark.sparkContext.getNextJobId, filterQu
 
 spark.sparkContext.addSparkListener(metadataListener)
 
-——————————————————————————————————————————————————————————————————————————————————————————————————————
