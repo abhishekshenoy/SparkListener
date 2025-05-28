@@ -7,18 +7,20 @@ import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.types._
-import org.apache.spark.util.AccumulatorV2
+import org.apache.spark.sql.SparkSession
+import org.apache.hadoop.fs.{FileSystem, Path}
 import scala.collection.mutable
 import scala.collection.concurrent.TrieMap
 import java.util.concurrent.ConcurrentHashMap
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import scala.util.{Try, Success, Failure}
 
 // Data Models
 case class SourceNodeDetail(
   tableName: String,
   folderName: String,
-  sourceType: String, // FILE, HIVE_TABLE, etc.
+  sourceType: String, // PARQUET_FILE, ORC_FILE
   columnsProjected: List[String],
   filtersApplied: List[String],
   metricsBeforeFilter: MetricsDetail,
@@ -29,7 +31,7 @@ case class SourceNodeDetail(
 case class TargetNodeDetail(
   tableName: String,
   folderName: String,
-  targetType: String,
+  targetType: String, // PARQUET_FILE, ORC_FILE
   metrics: MetricsDetail
 )
 
@@ -57,14 +59,13 @@ class SparkETLMetadataListener extends SparkListener {
   // Thread-safe collections for tracking metrics across jobs/stages/tasks
   private val jobToStageMetrics = new ConcurrentHashMap[Int, mutable.Map[Int, StageMetrics]]()
   private val stageToTaskMetrics = new ConcurrentHashMap[Int, mutable.ListBuffer[TaskMetrics]]()
-  private val jobToActionMetadata = new ConcurrentHashMap[Int, ActionMetadata]()
   private val activeJobs = new ConcurrentHashMap[Int, JobTrackingInfo]()
+  private val jobToQueryExecution = new ConcurrentHashMap[Int, org.apache.spark.sql.execution.QueryExecution]()
   
   case class JobTrackingInfo(
     jobId: Int,
     startTime: Long,
-    queryExecution: Option[Any] = None,
-    sqlContext: Option[Any] = None
+    stageIds: Array[Int]
   )
   
   case class StageMetrics(
@@ -77,16 +78,23 @@ class SparkETLMetadataListener extends SparkListener {
     var isCompleted: Boolean = false
   )
 
-  // Callback function to handle captured metadata
-  private var metadataCallback: ActionMetadata => Unit = _ => {}
+  // Fixed callback function declaration
+  private var metadataCallback: ActionMetadata => Unit = { _ => 
+    // Default empty implementation
+  }
   
   def setMetadataCallback(callback: ActionMetadata => Unit): Unit = {
     metadataCallback = callback
   }
 
+  // Hook to capture QueryExecution - this needs to be called from your application
+  def captureQueryExecution(jobId: Int, queryExecution: org.apache.spark.sql.execution.QueryExecution): Unit = {
+    jobToQueryExecution.put(jobId, queryExecution)
+  }
+
   override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
     val jobId = jobStart.jobId
-    val trackingInfo = JobTrackingInfo(jobId, jobStart.time)
+    val trackingInfo = JobTrackingInfo(jobId, jobStart.time, jobStart.stageIds)
     activeJobs.put(jobId, trackingInfo)
     
     // Initialize stage metrics for this job
@@ -146,10 +154,12 @@ class SparkETLMetadataListener extends SparkListener {
       } catch {
         case e: Exception =>
           println(s"Error extracting metadata for job $jobId: ${e.getMessage}")
+          e.printStackTrace()
       } finally {
         // Cleanup
         activeJobs.remove(jobId)
         jobToStageMetrics.remove(jobId)
+        jobToQueryExecution.remove(jobId)
       }
     }
   }
@@ -159,17 +169,14 @@ class SparkETLMetadataListener extends SparkListener {
     if (stageMetricsMap == null) return None
 
     try {
-      // Get the SparkSession to access query execution plans
-      val spark = org.apache.spark.sql.SparkSession.getActiveSession
-      if (spark.isEmpty) return None
+      val queryExecution = jobToQueryExecution.get(jobId)
+      if (queryExecution == null) {
+        println(s"No QueryExecution found for job $jobId")
+        return None
+      }
 
-      val sparkSession = spark.get
-      val queryExecution = getLastQueryExecution(sparkSession)
-      
-      if (queryExecution.isEmpty) return None
-
-      val logicalPlan = queryExecution.get.logical
-      val physicalPlan = queryExecution.get.executedPlan
+      val logicalPlan = queryExecution.logical
+      val physicalPlan = queryExecution.executedPlan
 
       // Extract source and target information
       val sourceNodes = extractSourceNodes(logicalPlan, physicalPlan, stageMetricsMap)
@@ -190,17 +197,8 @@ class SparkETLMetadataListener extends SparkListener {
     } catch {
       case e: Exception =>
         println(s"Error in extractActionMetadata: ${e.getMessage}")
+        e.printStackTrace()
         None
-    }
-  }
-
-  private def getLastQueryExecution(sparkSession: org.apache.spark.sql.SparkSession): Option[org.apache.spark.sql.execution.QueryExecution] = {
-    try {
-      // Access the last query execution from SparkSession
-      val lastQueryExecution = sparkSession.sessionState.executePlan(sparkSession.sql("SELECT 1").queryExecution.logical)
-      Some(lastQueryExecution)
-    } catch {
-      case _: Exception => None
     }
   }
 
@@ -212,91 +210,51 @@ class SparkETLMetadataListener extends SparkListener {
     
     val sourceNodes = mutable.ListBuffer[SourceNodeDetail]()
     
-    // Extract from logical plan
+    // Extract from logical plan - focus on LogicalRelation for file sources
     logicalPlan.foreach {
-      case relation: HiveTableRelation =>
-        val sourceNode = extractHiveTableSource(relation, stageMetrics)
-        sourceNodes += sourceNode
-        
       case relation: LogicalRelation =>
-        val sourceNode = extractFileSource(relation, stageMetrics)
-        sourceNodes += sourceNode
-        
+        relation.relation match {
+          case fsRelation: HadoopFsRelation =>
+            // Check if it's Parquet or ORC
+            val fileFormat = fsRelation.fileFormat
+            if (isParquetOrOrc(fileFormat)) {
+              val sourceNode = extractFileSourceFromLogicalRelation(relation, fsRelation, stageMetrics, logicalPlan)
+              sourceNodes += sourceNode
+            }
+          case _ => // Skip non-file sources
+        }
       case _ => // Skip other types
     }
     
-    // Extract from physical plan for additional context
+    // Extract from physical plan for additional context and filters
     physicalPlan.foreach {
       case scan: FileSourceScanExec =>
-        val sourceNode = extractFileSourceFromScan(scan, stageMetrics, logicalPlan)
-        sourceNodes += sourceNode
-        
-      case scan: BatchScanExec =>
-        val sourceNode = extractBatchScanSource(scan, stageMetrics)
-        sourceNodes += sourceNode
-        
+        val fileFormat = scan.relation.fileFormat
+        if (isParquetOrOrc(fileFormat)) {
+          val sourceNode = extractFileSourceFromScan(scan, stageMetrics, logicalPlan)
+          sourceNodes += sourceNode
+        }
       case _ => // Skip other types
     }
     
-    sourceNodes.toList.distinct
+    sourceNodes.toList.distinctBy(_.folderName)
   }
 
-  private def extractHiveTableSource(
-    relation: HiveTableRelation, 
-    stageMetrics: mutable.Map[Int, StageMetrics]
+  private def extractFileSourceFromLogicalRelation(
+    relation: LogicalRelation,
+    fsRelation: HadoopFsRelation,
+    stageMetrics: mutable.Map[Int, StageMetrics],
+    logicalPlan: LogicalPlan
   ): SourceNodeDetail = {
     
-    val tableName = s"${relation.tableMeta.database}.${relation.tableMeta.identifier.table}"
-    val folderName = relation.tableMeta.storage.locationUri.map(_.toString).getOrElse("")
-    
-    // Get projected columns
-    val projectedColumns = relation.output.map(_.name).toList
-    
-    // Extract filters (this is complex and requires traversing the plan)
-    val filters = extractFiltersFromRelation(relation)
-    
-    // Calculate metrics
-    val totalMetrics = aggregateStageMetrics(stageMetrics)
-    val metricsBeforeFilter = MetricsDetail(
-      recordsCount = totalMetrics.inputRecords,
-      bytesProcessed = totalMetrics.inputBytes,
-      filesCount = getFileCount(relation.tableMeta.storage.locationUri)
-    )
-    
-    // For after filter metrics, we need to estimate based on selectivity
-    val metricsAfterFilter = estimatePostFilterMetrics(metricsBeforeFilter, filters)
-    
-    SourceNodeDetail(
-      tableName = tableName,
-      folderName = folderName,
-      sourceType = "HIVE_TABLE",
-      columnsProjected = projectedColumns,
-      filtersApplied = filters,
-      metricsBeforeFilter = metricsBeforeFilter,
-      metricsAfterFilter = metricsAfterFilter,
-      partitionsScanned = extractPartitionsScanned(relation.tableMeta)
-    )
-  }
-
-  private def extractFileSource(
-    relation: LogicalRelation, 
-    stageMetrics: mutable.Map[Int, StageMetrics]
-  ): SourceNodeDetail = {
-    
-    val (tableName, folderName, sourceType, fileCount) = relation.relation match {
-      case fsRelation: HadoopFsRelation =>
-        val paths = fsRelation.location.rootPaths.map(_.toString)
-        val folderName = if (paths.nonEmpty) paths.head else ""
-        val tableName = extractTableNameFromPath(folderName)
-        val fileCount = fsRelation.location.listFiles(Nil, Nil).length.toLong
-        (tableName, folderName, "FILE_SOURCE", fileCount)
-        
-      case _ =>
-        ("unknown_table", "unknown_path", "UNKNOWN_SOURCE", 0L)
-    }
+    val paths = fsRelation.location.rootPaths.map(_.toString)
+    val folderName = if (paths.nonEmpty) paths.head else ""
+    val tableName = extractTableNameFromPath(folderName)
+    val sourceType = getFileSourceType(fsRelation.fileFormat)
     
     val projectedColumns = relation.output.map(_.name).toList
-    val filters = extractFiltersFromLogicalRelation(relation)
+    val filters = extractFiltersFromLogicalPlan(logicalPlan, relation)
+    val fileCount = getFileCount(fsRelation.location.rootPaths)
     
     val totalMetrics = aggregateStageMetrics(stageMetrics)
     val metricsBeforeFilter = MetricsDetail(
@@ -305,7 +263,7 @@ class SparkETLMetadataListener extends SparkListener {
       filesCount = fileCount
     )
     
-    val metricsAfterFilter = estimatePostFilterMetrics(metricsBeforeFilter, filters)
+    val metricsAfterFilter = calculatePostFilterMetrics(totalMetrics, filters)
     
     SourceNodeDetail(
       tableName = tableName,
@@ -314,7 +272,8 @@ class SparkETLMetadataListener extends SparkListener {
       columnsProjected = projectedColumns,
       filtersApplied = filters,
       metricsBeforeFilter = metricsBeforeFilter,
-      metricsAfterFilter = metricsAfterFilter
+      metricsAfterFilter = metricsAfterFilter,
+      partitionsScanned = extractPartitionInfo(fsRelation)
     )
   }
 
@@ -326,17 +285,26 @@ class SparkETLMetadataListener extends SparkListener {
     
     val folderName = scan.relation.location.rootPaths.headOption.map(_.toString).getOrElse("")
     val tableName = extractTableNameFromPath(folderName)
+    val sourceType = getFileSourceType(scan.relation.fileFormat)
     val projectedColumns = scan.output.map(_.name).toList
-    val filters = scan.dataFilters.map(_.toString).toList
-    val fileCount = scan.relation.location.listFiles(Nil, Nil).length.toLong
+    
+    // Extract filters from the scan - these are pushed down filters
+    val pushedFilters = scan.dataFilters.map(exprToString).toList
+    val partitionFilters = scan.partitionFilters.map(exprToString).toList
+    val allFilters = pushedFilters ++ partitionFilters
+    
+    val fileCount = getFileCount(scan.relation.location.rootPaths)
     
     val totalMetrics = aggregateStageMetrics(stageMetrics)
+    
+    // For FileSourceScanExec, we can get more accurate metrics
     val metricsBeforeFilter = MetricsDetail(
       recordsCount = totalMetrics.inputRecords,
       bytesProcessed = totalMetrics.inputBytes,
       filesCount = fileCount
     )
     
+    // After filter metrics - use output metrics from the scan stage
     val metricsAfterFilter = MetricsDetail(
       recordsCount = totalMetrics.outputRecords,
       bytesProcessed = totalMetrics.outputBytes,
@@ -346,37 +314,12 @@ class SparkETLMetadataListener extends SparkListener {
     SourceNodeDetail(
       tableName = tableName,
       folderName = folderName,
-      sourceType = "FILE_SOURCE",
+      sourceType = sourceType,
       columnsProjected = projectedColumns,
-      filtersApplied = filters,
+      filtersApplied = allFilters,
       metricsBeforeFilter = metricsBeforeFilter,
       metricsAfterFilter = metricsAfterFilter,
       partitionsScanned = scan.selectedPartitions.map(_.toString).toList
-    )
-  }
-
-  private def extractBatchScanSource(
-    scan: BatchScanExec, 
-    stageMetrics: mutable.Map[Int, StageMetrics]
-  ): SourceNodeDetail = {
-    
-    val tableName = scan.scan.description()
-    val projectedColumns = scan.output.map(_.name).toList
-    
-    val totalMetrics = aggregateStageMetrics(stageMetrics)
-    val metricsBeforeFilter = MetricsDetail(
-      recordsCount = totalMetrics.inputRecords,
-      bytesProcessed = totalMetrics.inputBytes
-    )
-    
-    SourceNodeDetail(
-      tableName = tableName,
-      folderName = "",
-      sourceType = "BATCH_SOURCE",
-      columnsProjected = projectedColumns,
-      filtersApplied = List.empty,
-      metricsBeforeFilter = metricsBeforeFilter,
-      metricsAfterFilter = metricsBeforeFilter
     )
   }
 
@@ -389,37 +332,183 @@ class SparkETLMetadataListener extends SparkListener {
     // Look for write operations in the logical plan
     logicalPlan.foreach {
       case command: SaveIntoDataSourceCommand =>
-        val totalMetrics = aggregateStageMetrics(stageMetrics)
-        return Some(TargetNodeDetail(
-          tableName = command.options.getOrElse("path", "unknown_target"),
-          folderName = command.options.getOrElse("path", ""),
-          targetType = "DATA_SOURCE",
-          metrics = MetricsDetail(
-            recordsCount = totalMetrics.outputRecords,
-            bytesProcessed = totalMetrics.outputBytes
-          )
-        ))
+        val path = command.options.getOrElse("path", "")
+        if (path.nonEmpty && isParquetOrOrcPath(path)) {
+          val totalMetrics = aggregateStageMetrics(stageMetrics)
+          val targetType = getTargetTypeFromPath(path)
+          return Some(TargetNodeDetail(
+            tableName = extractTableNameFromPath(path),
+            folderName = path,
+            targetType = targetType,
+            metrics = MetricsDetail(
+              recordsCount = totalMetrics.outputRecords,
+              bytesProcessed = totalMetrics.outputBytes,
+              filesCount = 1L // Will be determined after write
+            )
+          ))
+        }
         
-      case command: InsertIntoHiveTable =>
-        val tableName = s"${command.table.database}.${command.table.identifier.table}"
-        val totalMetrics = aggregateStageMetrics(stageMetrics)
-        return Some(TargetNodeDetail(
-          tableName = tableName,
-          folderName = command.table.storage.locationUri.map(_.toString).getOrElse(""),
-          targetType = "HIVE_TABLE",
-          metrics = MetricsDetail(
-            recordsCount = totalMetrics.outputRecords,
-            bytesProcessed = totalMetrics.outputBytes
-          )
-        ))
+      case command: CreateDataSourceTableAsSelectCommand =>
+        val table = command.table
+        val location = table.storage.locationUri.map(_.toString).getOrElse("")
+        if (location.nonEmpty && isParquetOrOrcPath(location)) {
+          val totalMetrics = aggregateStageMetrics(stageMetrics)
+          val targetType = getTargetTypeFromPath(location)
+          return Some(TargetNodeDetail(
+            tableName = s"${table.database}.${table.identifier.table}",
+            folderName = location,
+            targetType = targetType,
+            metrics = MetricsDetail(
+              recordsCount = totalMetrics.outputRecords,
+              bytesProcessed = totalMetrics.outputBytes
+            )
+          ))
+        }
         
+      case _ => // Continue searching
+    }
+    
+    // Check physical plan for write operations
+    physicalPlan.foreach {
+      case write: WriteFilesExec =>
+        // Extract path from write operation
+        val path = extractPathFromWriteExec(write)
+        if (path.nonEmpty && isParquetOrOrcPath(path)) {
+          val totalMetrics = aggregateStageMetrics(stageMetrics)
+          val targetType = getTargetTypeFromPath(path)
+          return Some(TargetNodeDetail(
+            tableName = extractTableNameFromPath(path),
+            folderName = path,
+            targetType = targetType,
+            metrics = MetricsDetail(
+              recordsCount = totalMetrics.outputRecords,
+              bytesProcessed = totalMetrics.outputBytes
+            )
+          ))
+        }
       case _ => // Continue searching
     }
     
     None
   }
 
-  // Helper methods
+  // Helper methods with actual implementations
+  private def isParquetOrOrc(fileFormat: org.apache.spark.sql.execution.datasources.FileFormat): Boolean = {
+    fileFormat match {
+      case _: org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat => true
+      case _: org.apache.spark.sql.execution.datasources.orc.OrcFileFormat => true
+      case _ => false
+    }
+  }
+
+  private def isParquetOrOrcPath(path: String): Boolean = {
+    val lowerPath = path.toLowerCase
+    lowerPath.contains(".parquet") || lowerPath.contains(".orc") || 
+    lowerPath.contains("parquet") || lowerPath.contains("orc")
+  }
+
+  private def getFileSourceType(fileFormat: org.apache.spark.sql.execution.datasources.FileFormat): String = {
+    fileFormat match {
+      case _: org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat => "PARQUET_FILE"
+      case _: org.apache.spark.sql.execution.datasources.orc.OrcFileFormat => "ORC_FILE"
+      case _ => "UNKNOWN_FILE"
+    }
+  }
+
+  private def getTargetTypeFromPath(path: String): String = {
+    val lowerPath = path.toLowerCase
+    if (lowerPath.contains("parquet")) "PARQUET_FILE"
+    else if (lowerPath.contains("orc")) "ORC_FILE"
+    else "FILE_SINK"
+  }
+
+  private def extractFiltersFromLogicalPlan(logicalPlan: LogicalPlan, targetRelation: LogicalRelation): List[String] = {
+    val filters = mutable.ListBuffer[String]()
+    
+    // Traverse the logical plan to find filters applied to this relation
+    logicalPlan.foreach {
+      case filter: Filter =>
+        // Check if this filter is applied to our target relation
+        if (isFilterAppliedToRelation(filter, targetRelation)) {
+          filters += exprToString(filter.condition)
+        }
+      case _ => // Continue searching
+    }
+    
+    filters.toList
+  }
+
+  private def isFilterAppliedToRelation(filter: Filter, targetRelation: LogicalRelation): Boolean = {
+    // Check if the filter's child is the target relation or contains it
+    def containsRelation(plan: LogicalPlan): Boolean = {
+      plan match {
+        case relation if relation == targetRelation => true
+        case _ => plan.children.exists(containsRelation)
+      }
+    }
+    
+    containsRelation(filter.child)
+  }
+
+  private def exprToString(expr: Expression): String = {
+    expr.prettyName match {
+      case name if name.nonEmpty => s"$name(${expr.children.map(_.toString).mkString(", ")})"
+      case _ => expr.toString
+    }
+  }
+
+  private def getFileCount(rootPaths: Seq[org.apache.hadoop.fs.Path]): Long = {
+    try {
+      val spark = SparkSession.getActiveSession
+      if (spark.isEmpty) return 1L
+      
+      val hadoopConf = spark.get.sessionState.newHadoopConf()
+      
+      rootPaths.map { path =>
+        Try {
+          val fs = path.getFileSystem(hadoopConf)
+          val fileStatus = fs.listStatus(path)
+          fileStatus.count(_.isFile).toLong
+        }.getOrElse(1L)
+      }.sum
+    } catch {
+      case _: Exception => 1L
+    }
+  }
+
+  private def extractPathFromWriteExec(write: WriteFilesExec): String = {
+    // Extract path from WriteFilesExec - this is version dependent
+    try {
+      write.toString match {
+        case s if s.contains("path=") =>
+          val pathStart = s.indexOf("path=") + 5
+          val pathEnd = s.indexOf(",", pathStart)
+          if (pathEnd > pathStart) s.substring(pathStart, pathEnd)
+          else s.substring(pathStart)
+        case _ => ""
+      }
+    } catch {
+      case _: Exception => ""
+    }
+  }
+
+  private def calculatePostFilterMetrics(stageMetrics: StageMetrics, filters: List[String]): MetricsDetail = {
+    if (filters.isEmpty) {
+      MetricsDetail(
+        recordsCount = stageMetrics.inputRecords,
+        bytesProcessed = stageMetrics.inputBytes,
+        filesCount = stageMetrics.filesRead
+      )
+    } else {
+      // Use output metrics as post-filter metrics when filters are present
+      MetricsDetail(
+        recordsCount = stageMetrics.outputRecords,
+        bytesProcessed = stageMetrics.outputBytes,
+        filesCount = stageMetrics.filesRead
+      )
+    }
+  }
+
   private def aggregateStageMetrics(stageMetrics: mutable.Map[Int, StageMetrics]): StageMetrics = {
     stageMetrics.values.foldLeft(StageMetrics(0)) { (acc, metrics) =>
       acc.inputRecords += metrics.inputRecords
@@ -431,63 +520,37 @@ class SparkETLMetadataListener extends SparkListener {
     }
   }
 
-  private def extractFiltersFromRelation(relation: HiveTableRelation): List[String] = {
-    // This would need to be implemented based on how filters are pushed down
-    // For now, returning empty list
-    List.empty
-  }
-
-  private def extractFiltersFromLogicalRelation(relation: LogicalRelation): List[String] = {
-    // Extract filters from the relation if available
-    List.empty
-  }
-
-  private def estimatePostFilterMetrics(beforeFilter: MetricsDetail, filters: List[String]): MetricsDetail = {
-    if (filters.isEmpty) {
-      beforeFilter
-    } else {
-      // Simple estimation - assume 50% selectivity for filters
-      // In practice, you might want to use Spark's statistics or implement more sophisticated estimation
-      val selectivity = 0.5
-      MetricsDetail(
-        recordsCount = (beforeFilter.recordsCount * selectivity).toLong,
-        bytesProcessed = (beforeFilter.bytesProcessed * selectivity).toLong,
-        filesCount = beforeFilter.filesCount
-      )
-    }
-  }
-
   private def extractTableNameFromPath(path: String): String = {
     if (path.nonEmpty) {
-      val parts = path.split("/")
-      parts.lastOption.getOrElse("unknown_table")
+      val normalizedPath = path.replaceAll("\\\\", "/")
+      val parts = normalizedPath.split("/")
+      val fileName = parts.lastOption.getOrElse("unknown_table")
+      // Remove file extensions if present
+      fileName.replaceAll("\\.(parquet|orc)$", "")
     } else {
       "unknown_table"
     }
   }
 
-  private def getFileCount(locationUri: Option[java.net.URI]): Long = {
-    // Implementation to count files in the location
-    // This is a placeholder - actual implementation would depend on your file system
-    1L
-  }
-
-  private def extractPartitionsScanned(tableMeta: CatalogTable): List[String] = {
-    // Extract partition information from table metadata
-    tableMeta.partitionColumnNames.toList
+  private def extractPartitionInfo(fsRelation: HadoopFsRelation): List[String] = {
+    try {
+      fsRelation.partitionSchema.fieldNames.toList
+    } catch {
+      case _: Exception => List.empty
+    }
   }
 
   private def determineActionType(logicalPlan: LogicalPlan): String = {
     logicalPlan match {
-      case _: Command => "COMMAND"
+      case _: Command => "WRITE_COMMAND"
       case plan if plan.find(_.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Aggregate]).nonEmpty => "AGGREGATION"
       case plan if plan.find(_.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Join]).nonEmpty => "JOIN"
-      case _ => "QUERY"
+      case _ => "READ_QUERY"
     }
   }
 }
 
-// Usage Example and Integration
+// Enhanced Usage Example with proper QueryExecution capture
 object SparkETLMetadataListenerExample {
   
   def main(args: Array[String]): Unit = {
@@ -496,6 +559,7 @@ object SparkETLMetadataListenerExample {
     val spark = SparkSession.builder()
       .appName("ETL Metadata Listener Example")
       .master("local[*]")
+      .config("spark.sql.adaptive.enabled", "false") // Disable AQE for clearer execution
       .getOrCreate()
     
     // Create and register the listener
@@ -508,6 +572,8 @@ object SparkETLMetadataListenerExample {
       println(s"Action Type: ${actionMetadata.actionType}")
       println(s"Timestamp: ${actionMetadata.timestamp}")
       println(s"Execution Time: ${actionMetadata.executionTimeMs}ms")
+      println(s"Job ID: ${actionMetadata.sparkJobId}")
+      println(s"Stage IDs: ${actionMetadata.sparkStageIds.mkString(", ")}")
       
       println("\n--- SOURCE NODES ---")
       actionMetadata.sourceNodes.foreach { source =>
@@ -515,15 +581,19 @@ object SparkETLMetadataListenerExample {
         println(s"Folder: ${source.folderName}")
         println(s"Type: ${source.sourceType}")
         println(s"Columns: ${source.columnsProjected.mkString(", ")}")
-        println(s"Filters: ${source.filtersApplied.mkString(", ")}")
-        println(s"Before Filter - Records: ${source.metricsBeforeFilter.recordsCount}, Bytes: ${source.metricsBeforeFilter.bytesProcessed}")
+        println(s"Filters: ${source.filtersApplied.mkString("; ")}")
+        println(s"Before Filter - Records: ${source.metricsBeforeFilter.recordsCount}, Bytes: ${source.metricsBeforeFilter.bytesProcessed}, Files: ${source.metricsBeforeFilter.filesCount}")
         println(s"After Filter - Records: ${source.metricsAfterFilter.recordsCount}, Bytes: ${source.metricsAfterFilter.bytesProcessed}")
+        if (source.partitionsScanned.nonEmpty) {
+          println(s"Partitions: ${source.partitionsScanned.mkString(", ")}")
+        }
         println()
       }
       
       println("--- TARGET NODE ---")
       actionMetadata.targetNode.foreach { target =>
         println(s"Table: ${target.tableName}")
+        println(s"Folder: ${target.folderName}")
         println(s"Type: ${target.targetType}")
         println(s"Records: ${target.metrics.recordsCount}, Bytes: ${target.metrics.bytesProcessed}")
       }
@@ -534,23 +604,51 @@ object SparkETLMetadataListenerExample {
     // Register the listener
     spark.sparkContext.addSparkListener(metadataListener)
     
-    // Example ETL operations
+    // Example ETL operations with QueryExecution capture
     import spark.implicits._
     
-    // Read from file source
-    val df1 = spark.read.parquet("path/to/input/data")
+    try {
+      // Create sample data for testing
+      val sampleData = (1 to 1000).map(i => (i, s"name_$i", 20 + (i % 50), if (i % 2 == 0) "active" else "inactive"))
+      val df = sampleData.toDF("id", "name", "age", "status")
+      
+      // Write sample data to parquet
+      df.write.mode("overwrite").parquet("/tmp/test_input.parquet")
+      
+      // Read from parquet file source
+      val inputDf = spark.read.parquet("/tmp/test_input.parquet")
+      
+      // Capture QueryExecution for the read operation
+      val readQuery = inputDf.queryExecution
+      
+      // Apply transformations with filters
+      val filteredDf = inputDf
+        .filter($"age" > 25)
+        .filter($"status" === "active")
+        .select("id", "name", "age")
+      
+      // Capture QueryExecution for the filtered operation
+      val filterQuery = filteredDf.queryExecution
+      
+      // Action that triggers the listener - collect
+      spark.sparkContext.setJobDescription("Collect filtered data")
+      metadataListener.captureQueryExecution(spark.sparkContext.getNextJobId, filterQuery)
+      val collectResult = filteredDf.collect()
+      println(s"Collected ${collectResult.length} records")
+      
+      // Write operation
+      spark.sparkContext.setJobDescription("Write to parquet")
+      val writeQuery = filteredDf.write.mode("overwrite").parquet("/tmp/test_output.parquet")
+      // Note: For write operations, capturing QueryExecution is more complex and may require custom hooks
+      
+    } catch {
+      case e: Exception =>
+        println(s"Error in example: ${e.getMessage}")
+        e.printStackTrace()
+    }
     
-    // Apply transformations with filters
-    val filteredDf = df1
-      .filter($"age" > 25)
-      .filter($"status" === "active")
-      .select("id", "name", "age", "salary")
-    
-    // Action that triggers the listener
-    val result = filteredDf.collect()
-    
-    // Write operation
-    filteredDf.write.mode("overwrite").parquet("path/to/output/data")
+    // Allow time for async operations to complete
+    Thread.sleep(2000)
     
     spark.stop()
   }
